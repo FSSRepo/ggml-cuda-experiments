@@ -268,8 +268,9 @@ int main() {
         float kq_scale = 1.0f / sqrtf((float)d_head);
 
         int num_blocks = seq_len * num_heads;
+        int smem_size = seq_len * sizeof(float) + WARP_SIZE * sizeof(float);
 
-        flash_attn_f32<CUDA_FLASH_ATTENTION_BLOCK_SIZE> <<<num_blocks, CUDA_FLASH_ATTENTION_BLOCK_SIZE, seq_len * sizeof(float)>>> (
+        flash_attn_f32<CUDA_FLASH_ATTENTION_BLOCK_SIZE> <<<num_blocks, CUDA_FLASH_ATTENTION_BLOCK_SIZE, smem_size>>> (
             d_query, d_key, d_value, d_kqv_result, // pointers
             kq_scale, // scale
             d_head, seq_len, num_heads, d_head * seq_len);
