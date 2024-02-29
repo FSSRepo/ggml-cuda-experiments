@@ -96,6 +96,8 @@ __global__ void flash_attn(const half* query,
                         const int diag_idx = d0 + lane_index * sum_diag;
                         seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
                     }
+
+                    // store sequence result
                     sscores[seq_idx] = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]); // save as float for softmax
                 }
             }
@@ -104,9 +106,17 @@ __global__ void flash_attn(const half* query,
         __syncthreads();
     }
 
+    // perform online softmax
+
+    {
+        
+    }
+
     const int tensor_elements = WMMA_M*WMMA_N;
 
-    { // fill `squery` buffer with scores (repeat if is needed)
+    // fill `squery` buffer with scores (repeat if is needed)
+
+    {
         /*
             [S0, S1, S2,
             S0, S1, S2,
