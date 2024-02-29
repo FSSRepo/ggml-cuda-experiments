@@ -2,14 +2,15 @@
 #define __UTILS__
 
 // A[M, K] B[K, N] = C[M, N]
-void mulmat_cpu(const float* A, const float* B, float* C, uint32_t M, uint32_t N, uint32_t K, bool B_transposed = false) {
+void mulmat_cpu(const float* A, const float* B, const float* mask, float* C, uint32_t M, uint32_t N, uint32_t K, float scale, bool B_transposed = false) {
     for(int c = 0; c < N; c++) {
         for(int r = 0; r < M; r++) {
             float acc = 0.0f;
             for(int k = 0; k < K; k++) {
-                    acc += A[r*K + k] * B[B_transposed ? (c*K + k) : k*N + c];
+                    acc += __half2float(__float2half(A[r*K + k])) *
+                        __half2float(__float2half(B[B_transposed ? (c*K + k) : k*N + c]));
             }
-            C[r*N + c] = acc;
+            C[r*N + c] = acc*scale + (mask != nullptr ? mask[c] : 0.0f);
         }
     }
 }

@@ -28,7 +28,7 @@ typedef nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K
 template<int head_dim, int num_warps, int kv_tensor, int kv_block>
 __global__ void flash_attn(const half* query,
     half* key /* reuse key buffer for partials result */,
-    const half* value, int kv_size, int reduce_block, int head_stride) {
+    const half* value, const half* mask, int kv_size, float scale, int reduce_block, int head_stride) {
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
 
@@ -36,7 +36,7 @@ __global__ void flash_attn(const half* query,
     half2* squery2      = (half2*)shmem; // load query buffer
     half * squery       = (half *)shmem; // probabilities buffer after online softmax
     float* sscores      = (float*)(shmem + head_dim*kv_tensor*sizeof(half)); // scores buffer after QK^T
-    float* warp_buffer  = (float*)(shmem + head_dim*kv_tensor*sizeof(half) + kv_block*sizeof(float) + (warp_index*head_dim*kv_tensor*sizeof(float)));
+    float* warp_buffer  = (float*)(shmem + head_dim*kv_tensor*sizeof(half) + (kv_block + 2)*sizeof(float) + (warp_index*(head_dim*kv_tensor + 2)*sizeof(float)));
 #ifndef FA_KV_BLOCK_256
     half*  warp_buffer_half = (half*)warp_buffer;
 #endif
@@ -73,7 +73,14 @@ __global__ void flash_attn(const half* query,
         const int sum_diag = WMMA_K / kv_tensor;
         // assert(kv_per_warp % kv_tensor == 0);
 
-        for (int kvi = warp_index*kv_per_warp; kvi < kv_block; kvi += num_warps*kv_per_warp) {
+#pragma unroll
+        for (int k0 = 0; k0 < kv_block; k0 += num_warps*kv_per_warp) {
+            const int kvi = k0 + warp_index*kv_per_warp;
+            if (kvi >= kv_block) {
+                break;
+            }
+
+#pragma unroll
             for (int kv = 0; kv < kv_per_warp; kv += kv_tensor) {
                 nvcuda::wmma::load_matrix_sync(key_m, key + head_stride*blockIdx.y + (blockIdx.x*kv_block + kvi + kv)*head_dim, 16);
                 nvcuda::wmma::fill_fragment(kq_m, 0.0f);
@@ -83,12 +90,13 @@ __global__ void flash_attn(const half* query,
                 // sum diagonal
                 if (lane_index < kv_tensor) {
                     float seq = 0.0f;
-    #pragma unroll
+                    const int seq_idx = kvi + kv + lane_index;
+#pragma unroll
                     for (int d0 = 0; d0 < sum_diag; d0++) {
                         const int diag_idx = d0 + lane_index * sum_diag;
                         seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
                     }
-                    sscores[kvi + kv + lane_index] = seq; // save as float for softmax
+                    sscores[seq_idx] = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]); // save as float for softmax
                 }
             }
         }
@@ -105,12 +113,25 @@ __global__ void flash_attn(const half* query,
             S0, S1, S2]
         */
         const int te_per_warp = tensor_elements / num_warps;
-        for (int si = warp_index*te_per_warp; si < tensor_elements; si += num_warps*te_per_warp) {
-            for (int tei = lane_index; tei < te_per_warp; tei += WARP_SIZE) {
+#pragma unroll
+        for (int s0 = 0; s0 < tensor_elements; s0 += num_warps*te_per_warp) {
+            const int si = s0 + warp_index*te_per_warp;
+            if(si >= tensor_elements) {
+                break;
+            }
+
+#pragma unroll
+            for (int t0 = 0; t0 < te_per_warp; t0 += WARP_SIZE) {
+                const int tei = t0 + lane_index;
+                if(tei >= te_per_warp) {
+                    break;
+                }
                 const int sq_offset = si + tei;
                 squery[sq_offset] = __float2half(sscores[sq_offset % kv_block]);
             }
         }
+
+        __syncthreads();
     }
 
 #ifdef FA_KV_BLOCK_256
@@ -121,9 +142,14 @@ __global__ void flash_attn(const half* query,
         Accum qkv_m;
 
         const int reduce_exccedent = reduce_block - gridDim.x;
+#pragma unroll
+        for(int h0 = 0; h0 < head_dim; h0 += num_warps) {
+            const int hi = h0 + warp_index;
+            if(hi >= head_dim) {
+                break;
+            }
 
-        for(int hi = warp_index; hi < head_dim; hi += num_warps) {
-            const int output_offset = blockIdx.y * head_dim * kv_size + hi * reduce_block;
+            const int output_offset = blockIdx.y * head_stride + hi * reduce_block;
 
             // `value` need to be transposed
             nvcuda::wmma::load_matrix_sync(value_m, value + hi * kv_size + blockIdx.x*kv_block + blockIdx.y * head_stride, 16);
@@ -224,7 +250,7 @@ __global__ void flash_attn(const half* query,
 }
 
 template<int head_dim, int num_warps>
-__global__ void fa_reduce(const half* key, float* qkv, int kv_size, int kv_blocks, int reduce_block) {
+__global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int kv_blocks, int reduce_block) {
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
 
@@ -252,8 +278,10 @@ __global__ void fa_reduce(const half* key, float* qkv, int kv_size, int kv_block
     const int head_offset = head_dim * kv_size * blockIdx.x;
     const int sum_diag = WMMA_K / hi_per_tensor;
 
-    for (int hi = warp_index*hi_per_tensor; hi < head_dim; hi += num_warps*hi_per_tensor) {
-        nvcuda::wmma::load_matrix_sync(partials, key + (head_offset + hi * reduce_block), 16);
+#pragma unroll
+    for (int h0 = 0; h0 < head_dim; h0 += num_warps*hi_per_tensor) {
+        const int hi = h0 + warp_index*hi_per_tensor;
+        nvcuda::wmma::load_matrix_sync(partials, red_buf + (head_offset + hi * reduce_block), 16);
         nvcuda::wmma::fill_fragment(qkv_m, 0.0f);
         nvcuda::wmma::mma_sync(qkv_m, scale, partials, qkv_m);
         nvcuda::wmma::store_matrix_sync(warp_buffer, qkv_m, 16, nvcuda::wmma::mem_row_major);
@@ -274,16 +302,19 @@ __global__ void fa_reduce(const half* key, float* qkv, int kv_size, int kv_block
 
 int main() {
     print_cuda_info();
-    int head_dim = 128, kv_size = 4096, num_heads = 32;
+    int head_dim = 128, kv_size = 16*1024, num_heads = 32;
+    float scale = 1.0f / sqrtf((float)head_dim);
     // allocate memory
 
     // input buffers
     float* query =  (float*)malloc(head_dim           * num_heads * sizeof(float)); // assume batch size 1
     float* key =    (float*)malloc(head_dim * kv_size * num_heads * sizeof(float));
     float* value =  (float*)malloc(head_dim * kv_size * num_heads * sizeof(float));
+    float* mask =   (float*)malloc(kv_size * sizeof(float));
 
     // output buffers
     float* qkv =    (float*)malloc(head_dim           * num_heads * sizeof(float)); // assume batch size 1
+    float* qkv_cuda = (float*)malloc(head_dim           * num_heads * sizeof(float)); // assume batch size 1
     float* scores = (float*)malloc(           kv_size * num_heads * sizeof(float)); // QK^T
 
     // fill buffers
@@ -293,22 +324,23 @@ int main() {
     random(query, head_dim * num_heads);
     random(key,   head_dim * kv_size * num_heads);
     random(value, head_dim * kv_size * num_heads);
+    random(mask,  kv_size);
 
     if(true) {
         // cpu cmputation
         for(int h = 0; h < num_heads; h++) {
-            mulmat_cpu(query + h*head_dim, key + (h * head_dim*kv_size), scores + h*kv_size, 1, kv_size, head_dim, true);
+            mulmat_cpu(query + h*head_dim, key + (h * head_dim*kv_size), mask, scores + h*kv_size, 1, kv_size, head_dim, scale, true);
         }
 
         // print_array("Scores", scores, kv_size, kv_size);
 
         for(int h = 0; h < num_heads; h++) {
-            mulmat_cpu(scores + h*kv_size, value + (h * head_dim*kv_size), qkv + h*head_dim, 1, head_dim, kv_size);
+            mulmat_cpu(scores + h*kv_size, value + (h * head_dim*kv_size), nullptr, qkv + h*head_dim, 1, head_dim, kv_size, 1.0f);
         }
 
-        print_array("QKV", qkv, 8, 16, head_dim);
+        // print_array("QKV", qkv, 8, 16, head_dim);
 
-        fill_buffer(qkv, 0.0f, head_dim * num_heads);
+        fill_buffer(qkv_cuda, 0.0f, head_dim * num_heads);
     }
 
     if(true) {
@@ -316,9 +348,14 @@ int main() {
         half * query_f16 =   (half*)malloc(head_dim           * num_heads * sizeof(half));
         half * key_f16 =     (half*)malloc(head_dim * kv_size * num_heads * sizeof(half));
         half * value_f16 =   (half*)malloc(head_dim * kv_size * num_heads * sizeof(half));
+        half * mask_f16 =    (half*)malloc(kv_size * sizeof(half));
 
         for(int i = 0; i < (head_dim           * num_heads); i ++) {
             query_f16[i] = __float2half(query[i]);
+        }
+
+        for(int i = 0; i < kv_size; i ++) {
+            mask_f16[i] = __float2half(mask[i]);
         }
 
         for(int i = 0; i < head_dim * kv_size * num_heads; i ++) {
@@ -327,6 +364,7 @@ int main() {
             value_f16[i] = __float2half(value[i]);
 #endif
         }
+
 #ifdef FA_KV_BLOCK_256
         // transpose value
         for(int h = 0; h < num_heads; h++) {
@@ -341,12 +379,13 @@ int main() {
         cudaStream_t stream;
         cudaStreamCreate(&stream);
 
-        half *d_query, *d_key, *d_value;
+        half *d_query, *d_key, *d_value, *d_mask;
         float *d_score, *d_qkv;
 
         cudaMalloc((void **)&d_query,   head_dim           * num_heads * sizeof(half));
         cudaMalloc((void **)&d_key,     head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_value,   head_dim * kv_size * num_heads * sizeof(half));
+        cudaMalloc((void **)&d_mask,    kv_size * sizeof(half));
 
         cudaMalloc((void **)&d_score,              kv_size * num_heads * sizeof(float));
         cudaMalloc((void **)&d_qkv,     head_dim           * num_heads * sizeof(float));
@@ -355,18 +394,19 @@ int main() {
         cudaMemcpyAsync(d_query, query_f16, head_dim           * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_key,   key_f16,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_value, value_f16, head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_mask,  mask_f16,  kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
 
         constexpr int kv_per_block = 256;
-        constexpr int num_warps = 4;
+        constexpr int num_warps = 8;
 
-        // assert(kv_size % kv_per_block == 0)
+        // assert(kv_size % kv_per_block == 0);
         dim3 grid_dim(kv_size / kv_per_block, num_heads, 1);
         dim3 block_dim(WARP_SIZE, num_warps, 1);
 
         int shmem =
             head_dim*2*sizeof(half) /* query buffer */ +
-            kv_per_block*sizeof(float) /* scores buffer */ +
-            num_warps*256*sizeof(float) /* tensor core result buffer per warp */;
+            (kv_per_block + 2)*sizeof(float) /* scores buffer */ +
+            num_warps * (256 + 2) * sizeof(float) /* tensor core result buffer per warp */;
         printf("\n\nShared memory: %.2f KB\n\n", shmem/1024.0f);
 
         // print_array("CUDA key", key_f16, 4, 4, head_dim);
@@ -378,18 +418,62 @@ int main() {
         int reduce_block = ((grid_dim.x + WMMA_M - 1) / WMMA_M) * WMMA_N;
         printf("reduce block: %d\n", reduce_block);
 
-        flash_attn<128, num_warps, 2, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>(d_query, d_key, d_value, kv_size, reduce_block, head_dim*kv_size);
+        // half* d_red_buffer;
+        // cudaMalloc((void **)&d_red_buffer, head_dim * reduce_block * num_heads * sizeof(half));
+
+        cudaStreamSynchronize(stream);
+
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        cudaEventRecord(start, stream);
+        flash_attn<128, num_warps, 2, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>
+            (d_query, d_key, d_value, d_mask, kv_size, scale, reduce_block, head_dim*kv_size);
 
         fa_reduce<128, num_warps><<<num_heads, block_dim, shmem, stream>>>(d_key, d_qkv, kv_size, kv_size / kv_per_block, reduce_block);
 
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+
+        float millis = 0.0f;
+        cudaEventElapsedTime(&millis, start, stop);
+
+        printf("cuda time: %.4f ms\n", millis);
+
         // transfer data from device to host
-        cudaMemcpyAsync(qkv, d_qkv, head_dim           * num_heads * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(qkv_cuda, d_qkv, head_dim           * num_heads * sizeof(float), cudaMemcpyDeviceToHost, stream);
+
+        // half* red_buffer = (half*)malloc(head_dim * reduce_block * num_heads * sizeof(half));
+        // cudaMemcpyAsync(red_buffer, d_red_buffer, head_dim * reduce_block * num_heads * sizeof(half), cudaMemcpyDeviceToHost, stream);
+
         // cudaMemcpyAsync(scores, d_score, kv_size * num_heads * sizeof(float), cudaMemcpyDeviceToHost, stream);
         cudaMemcpyAsync(key_f16, d_key, head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyDeviceToHost, stream);
 
         cudaStreamSynchronize(stream);
 
-        print_array("CUDA QKV", qkv, 8, 16, head_dim);
+        float max_diff = 0.0f;
+        int head_idx = 0, dim_idx = 0;
+
+        for(int h = 0; h < num_heads; h++) {
+            for(int i = 0; i < head_dim; i++) {
+                if(fabs(qkv[h*head_dim + i] - qkv_cuda[h*head_dim + i]) > max_diff) {
+                    max_diff = fabs(qkv[h*head_dim + i] - qkv_cuda[h*head_dim + i]);
+                    head_idx = h;
+                    dim_idx = i;
+                }
+            }
+        }
+
+        printf("R (%.4f) CUDA(%.4f) diff: %.4f - head = %d, dim = %d\n", qkv[head_idx*head_dim + dim_idx], qkv_cuda[head_idx*head_dim + dim_idx], max_diff, head_idx, dim_idx);
+
+        float res = 0.0f;
+        for(int i = 0;i < reduce_block; i ++) {
+            printf(i < grid_dim.x ? "%.4f " : "[%.4f] ", __half2float(key_f16[head_idx*head_dim*kv_size + dim_idx*reduce_block + i]));
+            res += __half2float(key_f16[head_idx*head_dim*kv_size + dim_idx*reduce_block + i]);
+        }
+        printf(" = %.4f\n", res);
+        // print_array("CUDA QKV", qkv_cuda, 8, 16, head_dim);
 
         // clean up device memory
         cudaFree(d_query);
@@ -403,6 +487,7 @@ int main() {
     free(key);
     free(value);
     free(qkv);
+    free(qkv_cuda);
     free(scores);
     return 0;
 }
