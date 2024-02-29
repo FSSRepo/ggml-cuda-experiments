@@ -1,0 +1,1 @@
+nvcc src/flash-matrix.cu -o build/tensor -arch sm_80 && build\tensor

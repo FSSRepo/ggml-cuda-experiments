@@ -4,12 +4,13 @@
 #include <cuda_runtime.h>
 
 struct dimen {
-        int x, y, z;
-        dimen(int x_, int y_, int z_) {
-                x = x_;
-                y = y_;
+    int x, y, z;
+
+    dimen(int x_, int y_, int z_) {
+        x = x_;
+        y = y_;
                 z = z_;
-        }
+    }
         
         int ne() {
                 return x * y * z;
@@ -40,8 +41,8 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
 template<int block_size>
 static __global__ void flash_attn_f32(const float* q, const float* k,const float* v, float* dst, float kq_scale,
         int d_head, int seq_len, int num_heads, int head_size) {
-        const int head = blockIdx.x / seq_len;
-        const int s = blockIdx.x % seq_len;
+        const int s = blockIdx.x;
+        const int head = blockIdx.y;
         const int tid = threadIdx.x;
 
         extern __shared__  char work_data[];
@@ -106,15 +107,16 @@ static __global__ void flash_attn_f32(const float* q, const float* k,const float
 
         __syncthreads();
         // softmax(QK^T)V
-        for (int d = tid; d < d_head; d += block_size) {
-                int dst_index = d + s * d_head + head * head_size;
-                int value_offset = d * seq_len +   head * head_size;
-                dst[dst_index] = 0.0f;
-                for(int ic = 0; ic < seq_len; ic++) {
+        for(int ic = tid; ic < seq_len; ic += block_size) {
+                for (int d = 0; d < d_head; d++) {
+                        int dst_index = d + s * d_head + head * head_size;
+                        int value_offset = d * seq_len + head * head_size;
+                        dst[dst_index] = 0.0f;
                         dst[dst_index] += v[value_offset + ic] * S[ic];
                 }
         }
 }
+
 
 int getSPcores(cudaDeviceProp devProp)
 {  
@@ -266,11 +268,11 @@ int main() {
         cudaMemcpy(d_value, Value, value_dim.ne() * sizeof(float), cudaMemcpyHostToDevice);
 
         float kq_scale = 1.0f / sqrtf((float)d_head);
-
-        int num_blocks = seq_len * num_heads;
         int smem_size = seq_len * sizeof(float) + WARP_SIZE * sizeof(float);
 
-        flash_attn_f32<CUDA_FLASH_ATTENTION_BLOCK_SIZE> <<<num_blocks, CUDA_FLASH_ATTENTION_BLOCK_SIZE, smem_size>>> (
+        dim3 grid_dim(seq_len, num_heads, 1);
+
+        flash_attn_f32<CUDA_FLASH_ATTENTION_BLOCK_SIZE> <<<grid_dim, CUDA_FLASH_ATTENTION_BLOCK_SIZE, smem_size>>> (
             d_query, d_key, d_value, d_kqv_result, // pointers
             kq_scale, // scale
             d_head, seq_len, num_heads, d_head * seq_len);
