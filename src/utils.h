@@ -56,29 +56,26 @@ void print_array(const char* name, float* arr, int cols, int count) {
         }
         printf("%0.4ff, ", arr[i]);
     }
-    printf("\n");
 }
 
 void print_array(const char* name, half* arr, int row_count, int cols_count, int row_size) {
     printf("---------------- %s ------------------\n", name);
     for(int r = 0;r < row_count; r ++) {
         for(int c = 0;c < cols_count; c ++) {
-            printf("%0.4ff, ", __half2float(arr[r * row_size + c]));
+            printf("%0.5ff, ", __half2float(arr[r * row_size + c]));
         }
         printf("\n");
     }
-    printf("\n");
 }
 
 void print_array(const char* name, float* arr, int row_count, int cols_count, int row_size) {
     printf("---------------- %s ------------------\n", name);
     for(int r = 0;r < row_count; r ++) {
         for(int c = 0;c < cols_count; c ++) {
-            printf("%0.4ff, ",arr[r * row_size + c]);
+            printf("%0.5ff, ",arr[r * row_size + c]);
         }
         printf("\n");
     }
-    printf("\n");
 }
 
 #endif // __UTILS__
