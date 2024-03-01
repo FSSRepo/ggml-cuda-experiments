@@ -15,6 +15,27 @@ void mulmat_cpu(const float* A, const float* B, const float* mask, float* C, uin
     }
 }
 
+void softmax(float* scores, int kv_size) {
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for(int i = 0; i < kv_size;i++) {
+        float s = scores[i];
+        if(s > M) {
+            S = 1.0f + S*expf(M - s);
+            M = s;
+        } else {
+            S += expf(s - M);
+        }
+    }
+
+    printf("M= %.4f, S=%.4f\n", M, S);
+
+    for(int i = 0; i < kv_size;i++) {
+        scores[i] = expf(scores[i] - M) / S;
+    }
+}
+
 void fill_buffer(float* arr, float val, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) {
         arr[i] = 0.0f;

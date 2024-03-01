@@ -15,13 +15,21 @@ typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, _
 typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> MatrixB;
 typedef nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>                          Accum;
 
-// static __device__ __forceinline__ float warp_reduce_sum(float x) {
-// #pragma unroll
-//     for (int mask = 16; mask > 0; mask >>= 1) {
-//         x += __shfl_xor_sync(0xffffffff, x, mask, 32);
-//     }
-//     return x;
-// }
+static __device__ __forceinline__ float warp_reduce_max(float x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x = fmaxf(__shfl_xor_sync(0xffffffff, x, mask, 32), x);
+    }
+    return x;
+}
+
+static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, mask, 32);
+    }
+    return x;
+}
 
 #define FA_KV_BLOCK_256
 
@@ -32,11 +40,13 @@ __global__ void flash_attn(const half* query,
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
 
+    const int warp_data_size = (head_dim*kv_tensor + 2);
+
     extern __shared__ char shmem[];
     half2* squery2      = (half2*)shmem; // load query buffer
     half * squery       = (half *)shmem; // probabilities buffer after online softmax
     float* sscores      = (float*)(shmem + head_dim*kv_tensor*sizeof(half)); // scores buffer after QK^T
-    float* warp_buffer  = (float*)(shmem + head_dim*kv_tensor*sizeof(half) + (kv_block + 2)*sizeof(float) + (warp_index*(head_dim*kv_tensor + 2)*sizeof(float)));
+    float* warp_buffer  = (float*)(shmem + head_dim*kv_tensor*sizeof(half) + (kv_block + 2)*sizeof(float) + (warp_index*warp_data_size*sizeof(float)));
 #ifndef FA_KV_BLOCK_256
     half*  warp_buffer_half = (half*)warp_buffer;
 #endif
@@ -73,33 +83,27 @@ __global__ void flash_attn(const half* query,
         const int sum_diag = WMMA_K / kv_tensor;
         // assert(kv_per_warp % kv_tensor == 0);
 
-#pragma unroll
-        for (int k0 = 0; k0 < kv_block; k0 += num_warps*kv_per_warp) {
-            const int kvi = k0 + warp_index*kv_per_warp;
-            if (kvi >= kv_block) {
-                break;
-            }
+        const int kvi = warp_index*kv_per_warp;
 
 #pragma unroll
-            for (int kv = 0; kv < kv_per_warp; kv += kv_tensor) {
-                nvcuda::wmma::load_matrix_sync(key_m, key + head_stride*blockIdx.y + (blockIdx.x*kv_block + kvi + kv)*head_dim, 16);
-                nvcuda::wmma::fill_fragment(kq_m, 0.0f);
-                nvcuda::wmma::mma_sync(kq_m, query_m, key_m, kq_m);
-                nvcuda::wmma::store_matrix_sync(warp_buffer, kq_m, 16, nvcuda::wmma::mem_row_major);
+        for (int kv = 0; kv < kv_per_warp; kv += kv_tensor) {
+            nvcuda::wmma::load_matrix_sync(key_m, key + head_stride*blockIdx.y + (blockIdx.x*kv_block + kvi + kv)*head_dim, 16);
+            nvcuda::wmma::fill_fragment(kq_m, 0.0f);
+            nvcuda::wmma::mma_sync(kq_m, query_m, key_m, kq_m);
+            nvcuda::wmma::store_matrix_sync(warp_buffer, kq_m, 16, nvcuda::wmma::mem_row_major);
 
-                // sum diagonal
-                if (lane_index < kv_tensor) {
-                    float seq = 0.0f;
-                    const int seq_idx = kvi + kv + lane_index;
+            // sum diagonal
+            if (lane_index < kv_tensor) {
+                float seq = 0.0f;
+                const int seq_idx = kvi + kv + lane_index;
 #pragma unroll
-                    for (int d0 = 0; d0 < sum_diag; d0++) {
-                        const int diag_idx = d0 + lane_index * sum_diag;
-                        seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
-                    }
-
-                    // store sequence result
-                    sscores[seq_idx] = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]); // save as float for softmax
+                for (int d0 = 0; d0 < sum_diag; d0++) {
+                    const int diag_idx = d0 + lane_index * sum_diag;
+                    seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
                 }
+
+                // store sequence result
+                sscores[seq_idx] = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]); // save as float for softmax
             }
         }
 
@@ -107,38 +111,87 @@ __global__ void flash_attn(const half* query,
     }
 
     // perform online softmax
-
     {
-        
-    }
+        const int kv_per_warp = kv_block / num_warps;
+        float M = -INFINITY;
 
-    const int tensor_elements = WMMA_M*WMMA_N;
+        const int kvi = warp_index*kv_per_warp;
 
-    // fill `squery` buffer with scores (repeat if is needed)
+        for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
+            M = fmaxf(M, fmaxf(sscores[kvi + kv], sscores[kvi + kv + 1]));
+        }
 
-    {
+        M = warp_reduce_max(M);
+
+        float S = 0.0f;
+
+        for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
+            S += expf(sscores[kvi + kv] - M);
+            S += expf(sscores[kvi + kv + 1] - M);
+        }
+
+        S = warp_reduce_sum(S);
+
+        if(lane_index == 0) {
+            warp_buffer[0] = M;
+            warp_buffer[1] = S;
+            // printf("warp index: %d, M= %.4f, S= %.4f\n", warp_index, M, S);
+        }
+
+        __syncthreads();
+
+        // reduce warps
+        if(warp_index == 0 && lane_index == 0) {
+            float M0 = warp_buffer[0];
+            float S0 = warp_buffer[1];
+
+            for(int w = 1; w < num_warps; w++) {
+                float M1 = warp_buffer[w * warp_data_size];
+                float S1 = warp_buffer[w * warp_data_size + 1];
+
+                float M = fmaxf(M0, M1);
+
+                float ms0 = expf(M0 - M);
+                float ms1 = expf(M1 - M);
+
+                S0 = S0*ms0 + S1*ms1;
+                M0 = M;
+            }
+
+            // printf("block M = %.4f, S= %.4f\n", M0, S0);
+
+            // real softmax M and S for this block
+            sscores[kv_block] = M0;
+            sscores[kv_block + 1] = S0;
+        }
+
+        __syncthreads();
+
+        const int tensor_elements = WMMA_M * WMMA_N;
+
         /*
             [S0, S1, S2,
             S0, S1, S2,
             S0, S1, S2]
         */
+
+        // reuse shared memory padding
+        M = sscores[kv_block];
+        S = sscores[kv_block + 1];
+
         const int te_per_warp = tensor_elements / num_warps;
+
+        const int si = warp_index*te_per_warp;
+
 #pragma unroll
-        for (int s0 = 0; s0 < tensor_elements; s0 += num_warps*te_per_warp) {
-            const int si = s0 + warp_index*te_per_warp;
-            if(si >= tensor_elements) {
+        for (int t0 = 0; t0 < te_per_warp; t0 += WARP_SIZE) {
+            const int tei = t0 + lane_index;
+            if(tei >= te_per_warp) {
                 break;
             }
 
-#pragma unroll
-            for (int t0 = 0; t0 < te_per_warp; t0 += WARP_SIZE) {
-                const int tei = t0 + lane_index;
-                if(tei >= te_per_warp) {
-                    break;
-                }
-                const int sq_offset = si + tei;
-                squery[sq_offset] = __float2half(sscores[sq_offset % kv_block]);
-            }
+            const int sq_offset = si + tei;
+            squery[sq_offset] = __float2half(expf(sscores[sq_offset % kv_block] - M) / S);
         }
 
         __syncthreads();
@@ -312,7 +365,7 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int kv_b
 
 int main() {
     print_cuda_info();
-    int head_dim = 128, kv_size = 16*1024, num_heads = 32;
+    int head_dim = 128, kv_size = 256, num_heads = 1;
     float scale = 1.0f / sqrtf((float)head_dim);
     // allocate memory
 
@@ -340,6 +393,7 @@ int main() {
         // cpu cmputation
         for(int h = 0; h < num_heads; h++) {
             mulmat_cpu(query + h*head_dim, key + (h * head_dim*kv_size), mask, scores + h*kv_size, 1, kv_size, head_dim, scale, true);
+            softmax(scores + h*kv_size, kv_size);
         }
 
         // print_array("Scores", scores, kv_size, kv_size);
@@ -407,7 +461,7 @@ int main() {
         cudaMemcpyAsync(d_mask,  mask_f16,  kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
 
         constexpr int kv_per_block = 256;
-        constexpr int num_warps = 8;
+        constexpr int num_warps = 4;
 
         // assert(kv_size % kv_per_block == 0);
         dim3 grid_dim(kv_size / kv_per_block, num_heads, 1);
