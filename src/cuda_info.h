@@ -42,4 +42,47 @@ void print_cuda_info() {
             printf("Max Block Size: (%d, %d, %d)\n\n", deviceProp.maxThreadsDim[0], deviceProp.maxThreadsDim[1], deviceProp.maxThreadsDim[2]);
     }
 }
+
+static __device__ __forceinline__ float warp_reduce_max(float x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x = fmaxf(__shfl_xor_sync(0xffffffff, x, mask, 32), x);
+    }
+    return x;
+}
+
+
+static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, mask, 32));
+    }
+    return a;
+}
+
+static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, mask, 32);
+    }
+    return x;
+}
+
+
+static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x = __hmax2(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
+    }
+    return x;
+}
+
+static __device__ __forceinline__ half warp_reduce_max(half x) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        x = __hmax(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
+    }
+    return x;
+}
+
 #endif // __CUDAINFO__

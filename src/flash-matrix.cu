@@ -4,32 +4,8 @@
 #include <stdlib.h>
 #include "cuda_info.h"
 #include "utils.h"
-
-#define WARP_SIZE 32
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
-
-typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> MatrixA;
-typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::col_major> MatrixBT;
-typedef nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> MatrixB;
-typedef nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>                          Accum;
-
-static __device__ __forceinline__ float warp_reduce_max(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        x = fmaxf(__shfl_xor_sync(0xffffffff, x, mask, 32), x);
-    }
-    return x;
-}
-
-static __device__ __forceinline__ float warp_reduce_sum(float x) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, mask, 32);
-    }
-    return x;
-}
+#include "tensor-mma.h"
+#include "flash-llama.h"
 
 #define FA_KV_BLOCK_256
 
@@ -170,9 +146,11 @@ __global__ void flash_attn(const half* query,
         const int tensor_elements = WMMA_M * WMMA_N;
 
         /*
+
             [S0, S1, S2,
             S0, S1, S2,
             S0, S1, S2]
+
         */
 
         // reuse shared memory padding
@@ -412,20 +390,33 @@ int main() {
         half * query_f16 =   (half*)malloc(head_dim           * num_heads * sizeof(half));
         half * key_f16 =     (half*)malloc(head_dim * kv_size * num_heads * sizeof(half));
         half * value_f16 =   (half*)malloc(head_dim * kv_size * num_heads * sizeof(half));
+        half * value_f16_nT =   (half*)malloc(head_dim * kv_size * num_heads * sizeof(half));
         half * mask_f16 =    (half*)malloc(kv_size * sizeof(half));
+        half * mask_f16_padded = (half*)malloc(kv_size * 16 * sizeof(half));
 
         for(int i = 0; i < (head_dim           * num_heads); i ++) {
             query_f16[i] = __float2half(query[i]);
         }
 
-        for(int i = 0; i < kv_size; i ++) {
-            mask_f16[i] = __float2half(mask[i]);
+        
+
+        for(int b = 0; b < 16; b ++) {
+            for(int i = 0; i < kv_size; i ++) {
+                if(b == 0) {
+                    mask_f16[i] = __float2half(mask[i]);
+                    mask_f16_padded[i] = __float2half(mask[i]);
+                } else {
+                    mask_f16_padded[b*kv_size + i] =  __float2half(0.0f);
+                }
+            }
         }
 
         for(int i = 0; i < head_dim * kv_size * num_heads; i ++) {
             key_f16[i] = __float2half(key[i]);
 #ifndef FA_KV_BLOCK_256
             value_f16[i] = __float2half(value[i]);
+#else
+            value_f16_nT[i] = __float2half(value[i]);
 #endif
         }
 
@@ -442,23 +433,32 @@ int main() {
 
         cudaStream_t stream;
         cudaStreamCreate(&stream);
+        float* d_query_f32;
 
-        half *d_query, *d_key, *d_value, *d_mask;
+        half *d_query, *d_key, *d_value, *d_value_nT, *d_mask, *d_padded_mask;
         float *d_score, *d_qkv;
 
         cudaMalloc((void **)&d_query,   head_dim           * num_heads * sizeof(half));
+        cudaMalloc((void **)&d_query_f32,  head_dim        * num_heads * sizeof(float));
+
         cudaMalloc((void **)&d_key,     head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_value,   head_dim * kv_size * num_heads * sizeof(half));
+        cudaMalloc((void **)&d_value_nT,  head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_mask,    kv_size * sizeof(half));
+        cudaMalloc((void **)&d_padded_mask,  16 *  kv_size * sizeof(half));
 
         cudaMalloc((void **)&d_score,              kv_size * num_heads * sizeof(float));
         cudaMalloc((void **)&d_qkv,     head_dim           * num_heads * sizeof(float));
 
         // copy CPU data to GPU memory blocks
         cudaMemcpyAsync(d_query, query_f16, head_dim           * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_query_f32, query, head_dim           * num_heads * sizeof(float), cudaMemcpyHostToDevice, stream);
+
         cudaMemcpyAsync(d_key,   key_f16,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_value, value_f16, head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_value_nT, value_f16_nT, head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_mask,  mask_f16,  kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_padded_mask,  mask_f16_padded, 16 * kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
 
         constexpr int kv_per_block = 256;
         constexpr int num_warps = 4;
@@ -492,10 +492,31 @@ int main() {
         cudaEventCreate(&stop);
 
         cudaEventRecord(start, stream);
-        flash_attn<128, num_warps, 2, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>
+        bool paralell_kv = false;
+        if(paralell_kv) {
+            flash_attn<128, num_warps, 2, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>
             (d_query, d_key, d_value, d_mask, kv_size, scale, reduce_block, head_dim*kv_size);
 
-        fa_reduce<128, num_warps><<<num_heads, block_dim, shmem, stream>>>(d_key, d_qkv, kv_size, kv_size / kv_per_block, reduce_block);
+            fa_reduce<128, num_warps><<<num_heads, block_dim, shmem, stream>>>(d_key, d_qkv, kv_size, kv_size / kv_per_block, reduce_block);
+        } else {
+            // launch llama.cpp implementation
+            const int nwarps = 2;
+            constexpr int nqpb = 16;
+            constexpr int ncpw = 128;
+            printf("n_warps = %i\n", nwarps);
+
+            dim3 blocks_num(1, num_heads, 1);
+            dim3 block_dim(32, nwarps, 1);
+
+            const size_t shmem_f_ = 16*(head_dim + nwarps*(ncpw + nqpb))*(sizeof(float)/2);
+
+            flash_attn_ext_f16<128, nqpb, ncpw><<<blocks_num, block_dim, shmem_f_, stream>>>(
+                (const char*)d_query_f32, (const char*)d_key, (const char*)d_value_nT, (const char*)d_padded_mask, d_qkv, scale,
+                head_dim, 1, num_heads, 1, head_dim, kv_size, num_heads, 1, kv_size, 16*2,
+                head_dim*4, head_dim*4, head_dim*num_heads*4,
+                head_dim*2, head_dim*kv_size*2, head_dim*kv_size*num_heads*2,
+                head_dim, num_heads, 1, 1);
+        }
 
         cudaEventRecord(stop, stream);
         cudaEventSynchronize(stop);
