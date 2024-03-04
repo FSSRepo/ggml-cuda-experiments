@@ -29,7 +29,7 @@ void softmax(float* scores, int kv_size) {
         }
     }
 
-    printf("M= %.4f, S=%.4f\n", M, S);
+    //printf("M= %.4f, S=%.4f\n", M, S);
 
     for(int i = 0; i < kv_size;i++) {
         scores[i] = expf(scores[i] - M) / S;
@@ -76,6 +76,7 @@ void print_array(const char* name, float* arr, int row_count, int cols_count, in
         }
         printf("\n");
     }
+    printf("\n");
 }
 
 #endif // __UTILS__
