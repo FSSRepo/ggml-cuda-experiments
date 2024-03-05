@@ -1,1 +1,1 @@
-nvcc src/flash-matrix.cu -o build/tensor -lineinfo -arch sm_70 && build/tensor --no-kv-parallel
+nvcc src/flash-matrix.cu -o build/tensor -lineinfo -arch sm_70 && build/tensor
