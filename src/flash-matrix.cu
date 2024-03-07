@@ -2,6 +2,8 @@
 #include <mma.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <algorithm>
 #include "cuda_info.h"
 #include "utils.h"
 #include "tensor-mma.h"
