@@ -59,7 +59,7 @@ void kernel_test(int argc, const char* argv[]) {
             mulmat_cpu(scores + h*kv_size, value + (h * head_dim*kv_size), nullptr, qkv + h*head_dim, 1, head_dim, kv_size, 1.0f);
         }
 
-        print_array("Reference", qkv, 2, 16, head_dim);
+        print_array("Reference", qkv, 1, 16, head_dim);
 
         fill_buffer(qkv_cuda, 0.0f, head_dim * num_heads);
     }
@@ -115,7 +115,7 @@ void kernel_test(int argc, const char* argv[]) {
         cudaMalloc((void **)&d_value,   head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_value_nT,  head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_mask,    kv_size * sizeof(half));
-        cudaMalloc((void **)&d_padded_mask,  16 *  kv_size * sizeof(half));
+        cudaMalloc((void **)&d_padded_mask,  32 *  kv_size * sizeof(half));
 
         cudaMalloc((void **)&d_score,              kv_size * num_heads * sizeof(float));
         cudaMalloc((void **)&d_qkv,     head_dim           * num_heads * sizeof(float));
@@ -127,7 +127,7 @@ void kernel_test(int argc, const char* argv[]) {
         cudaMemcpyAsync(d_value, value_f16, head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_value_nT, value_f16_nT, head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_mask,  mask_f16,  kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_padded_mask,  mask_f16_padded, 16 * kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_padded_mask,  mask_f16_padded, 32 * kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
 
         constexpr int kv_per_block = 256;
 
@@ -175,7 +175,7 @@ void kernel_test(int argc, const char* argv[]) {
             }
         } else {
             // launch llama.cpp implementation
-            const int nwarps = 8;
+            const int nwarps = 2;
             constexpr int nqpb = 16;
             constexpr int ncpw = 128;
 
@@ -186,8 +186,7 @@ void kernel_test(int argc, const char* argv[]) {
 
             flash_attn_ext_f16<128, nqpb, ncpw><<<blocks_num, block_dim, shmem_f_, stream>>>(
                 (const char*)d_query, (const char*)d_key, (const char*)d_value_nT, (const char*)d_padded_mask, d_qkv, scale,
-                head_dim, 1, num_heads, 1, head_dim, kv_size, num_heads, 1, kv_size, 16*2,
-                head_dim*4, head_dim*4, head_dim*num_heads*4,
+                head_dim, 1, num_heads, 1, head_dim, kv_size, num_heads, 1, 32, kv_size*2, head_dim*4, head_dim*4, head_dim*num_heads*4,
                 head_dim*2, head_dim*kv_size*2, head_dim*kv_size*num_heads*2,
                 head_dim, num_heads, 1, 1);
         }
@@ -204,7 +203,7 @@ void kernel_test(int argc, const char* argv[]) {
 
         cudaStreamSynchronize(stream);
 
-        print_array(paralell_kv ? "Parallel KV CUDA" : "No paralell KV CUDA", qkv_cuda, 2, 16, head_dim);
+        print_array(paralell_kv ? "Parallel KV CUDA" : "No paralell KV CUDA", qkv_cuda, 1, 16, head_dim);
 
         float max_diff = 0.0f;
         int head_idx = 0, dim_idx = 0;
