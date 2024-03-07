@@ -216,11 +216,21 @@ static __global__ void flash_attn_ext_f16(
 
                     const half2 s = ss2[j*T2 + p];
 
+                    // int seq_idx = p*2 + ic;
+
+                    // if(seq_idx >= 124 && seq_idx < 132 && j == 1) {
+                    //     printf("QK seq %d = %.4f | warp= %d\nQK seq %d = %.4f | warp= %d\n", p*2 + ic, __half2float(s.x), warp_id, p*2 + ic + 1, __half2float(s.y), warp_id);
+                    // }
+
                     smax = __hmax2(smax, s);
                     M[j] = __hmax(M[j], __hmax(s.x, s.y));
                 }
 
                 M[j] = warp_reduce_max(M[j]);
+
+                // if(j == 0 && lane_id == 0) {
+                //     printf("max: %.4f, warp= %d\n", __half2float(M[0]), warp_id);
+                // }
 
                 // local sum
                 half2 ls = make_half2(0.0f, 0.0f);
@@ -228,6 +238,11 @@ static __global__ void flash_attn_ext_f16(
 
                 for (int p0 = 0; p0 < C2; p0 += NW) {
                     const int p = p0 + lane_id;
+
+                    if(__hisinf(M[j]) == -1) {
+                        ss2[j*T2 + p] = ls;
+                        continue;
+                    }
 
                     const half2 s = ss2[j*T2 + p];
 
@@ -244,19 +259,40 @@ static __global__ void flash_attn_ext_f16(
                 const half ms = hexp(m - M[j]);
 
                 // create a QxQ diagonal matrix for rescaling the output
-                if (lane_id == j) {
+                if (lane_id == j && !__hisnan(ms)) {
                     ss[j*T + C + j] = ms;
 
-                    S = S*ms + ls.x + ls.y;
+                    S = S*ss[j*T + C + j] + ls.x + ls.y;
                 }
+
+                // if(j == 1 && lane_id == 0) {
+                //     printf("sum: %.4f, warp= %d, j= %d\n", __half2float(S), warp_id, j);
+                // }
             }
 
             smax = warp_reduce_max(smax);
+
+            // if(lane_id == 0) {
+            //     printf("max 0: %.4f, max 1: %.4f, warp= %d\n", __half2float(smax.x), __half2float(smax.y), warp_id);
+            // }
 
             // skip -INF blocks
             if (__hisinf(smax.x) == -1 && __hisinf(smax.y) == -1) {
                 continue;
             }
+
+            __syncthreads();
+
+            // if(lane_id == 0 && warp_id == 1) {
+            //     printf("diag MS: %d\n", warp_id);
+            //     for(int j = 0; j < Q; j++) {
+            //         for (int c = 0; c < 16; c ++) {
+            //             printf("%.4f ", __half2float(ss[j*T + C + c]));
+            //         }
+            //         printf("\n");
+            //     }
+            // }
+            // __syncthreads();
 
             // O = diag(ms)*O
             for (int j = 0; j < Q16; ++j) {
@@ -269,9 +305,14 @@ static __global__ void flash_attn_ext_f16(
                     // convert accumulator to matrix_b
                     nvcuda::wmma::store_matrix_sync(     ss + 16*j*T + C + 16*j, lo[j][i], T, nvcuda::wmma::mem_row_major);
                     nvcuda::wmma::load_matrix_sync (lob, ss + 16*j*T + C + 16*j, T);
-
                     nvcuda::wmma::mma_sync(lo[j][i], mm, lob, zr);
+
+                    // if(warp_id == 1) {
+                    //     nvcuda::wmma::store_matrix_sync(sq + 16*j*T + i*16, lo[j][i], T, nvcuda::wmma::mem_row_major);
+                    // }
                 }
+
+                __syncthreads();
             }
 
             // restore zeros
@@ -304,6 +345,8 @@ static __global__ void flash_attn_ext_f16(
         if (lane_id < Q) {
             ss[lane_id*T + 0] = S;
             ss[lane_id*T + 1] = M[lane_id];
+
+            // printf("S: %.4f, M: %.4f, warp= %d\n", __half2float(S), __half2float(M[lane_id]), warp_id);
         }
     }
 
@@ -388,6 +431,7 @@ static __global__ void flash_attn_ext_f16(
                     break;
                 }
 
+                // printf("hdim %d = %.4f - %.4f\n", i, __half2float(sq[j*T + i]), __half2float(S));
                 dst[(iq3*ne2*ne1 + iq2 + (iq1 + j)*ne1)*D + i] = __half2float(sq[j*T + i] / S);
             }
         }

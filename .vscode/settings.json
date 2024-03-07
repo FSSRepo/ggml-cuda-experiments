@@ -16,6 +16,8 @@
         "xlocmon": "cpp",
         "xtr1common": "cpp",
         "cmath": "cpp",
-        "cstring": "cpp"
+        "cstring": "cpp",
+        "xlocale": "cpp",
+        "ratio": "cpp"
     }
 }

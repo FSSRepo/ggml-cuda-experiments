@@ -4,7 +4,7 @@
 #define FA_KV_BLOCK_256
 
 template<int head_dim, int num_warps, int kv_tensor, int kv_block>
-__global__ void flash_attn_row(const half* query, half* key /* reuse key buffer for partials result */,
+__global__ void flash_attn_row(const float* query, half* key /* reuse key buffer for partials result */,
     const half* value, const half* mask, int kv_size, float scale, int reduce_block, int head_stride) {
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
@@ -22,7 +22,7 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
     const int HD2 = head_dim / 2;
 
     // load query with 128x2 shape (repeat row twice)
-    const half2* query_ = (const half2*)(query + head_dim*blockIdx.y); // shift as head
+    const float2* query_ = (const float2*)(query + head_dim*blockIdx.y); // shift as head
 #pragma unroll
     for (int j = 0; j < kv_tensor; j += num_warps) {
         const int q_off = j + warp_index;
@@ -36,7 +36,7 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
             if (h_offset >= HD2) {
                 break;
             }
-            squery2[q_off*HD2 + h_offset] = query_[h_offset];
+            squery2[q_off*HD2 + h_offset] = __float22half2_rn(query_[h_offset]);
         }
     }
 
@@ -70,7 +70,6 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
                     const int diag_idx = d0 + lane_index * sum_diag;
                     seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
                 }
-
                 // store sequence result
                 sscores[seq_idx] = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]); // save as float for softmax
             }
@@ -78,8 +77,7 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
 
         __syncthreads();
     }
-
-    // perform online softmax
+// perform online softmax
     {
         const int kv_per_warp = kv_block / num_warps;
         float M = -INFINITY;
@@ -94,14 +92,19 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
 
         float S = 0.0f;
 
-        for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
-            S += expf(sscores[kvi + kv] - M);
-            S += expf(sscores[kvi + kv + 1] - M);
+        if(M > -INFINITY) {
+            for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
+                S += expf(sscores[kvi + kv] - M);
+                S += expf(sscores[kvi + kv + 1] - M);
+            }
         }
+        // else if(lane_index == 0 && blockIdx.y == 0) {
+        //     printf("ignore: %d -> %d\n", kvi, kvi + kv_per_warp);
+        // }
 
         S = warp_reduce_sum(S);
 
-        if(lane_index == 0) {
+        if(lane_index == 0) { // first head
             warp_buffer[0] = M;
             warp_buffer[1] = S;
             // printf("warp index: %d, M= %.4f, S= %.4f\n", warp_index, M, S);
@@ -127,7 +130,7 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
                 M0 = M;
             }
 
-            // printf("block M = %.4f, S= %.4f\n", M0, S0);
+            // printf("M = %.4f, S= %.4f\n", M0, S0);
 
             // real softmax M and S for this block
             sscores[kv_block] = M0;
@@ -213,9 +216,10 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
                 // printf("real dim %d = %.4f, S=%.4f\n", hi, real_dim, sscores[kv_block + 1]);
 
                 // assume the key has been processed by blocks launched per head
+
                 key[output_offset + blockIdx.x] = __float2half(hdim);
-                key[blockIdx.y * head_stride + head_dim*reduce_block + blockIdx.x*2] = __float2half(sscores[kv_block]); // max of this kv block
-                key[blockIdx.y * head_stride + head_dim*reduce_block + blockIdx.x*2 + 1] = __float2half(sscores[kv_block + 1]); // sum of this kv block
+                key[blockIdx.y * head_stride + head_dim * reduce_block + blockIdx.x*2] = __float2half(sscores[kv_block]); // max of this kv block
+                key[blockIdx.y * head_stride + head_dim * reduce_block + blockIdx.x*2 + 1] = __float2half(sscores[kv_block + 1]); // sum of this kv block
 
                 if(blockIdx.x == 0) { // just the first block will do this
                     for(int i = 0; i < reduce_exccedent; i ++) {
@@ -227,7 +231,6 @@ __global__ void flash_attn_row(const half* query, half* key /* reuse key buffer 
         }
     }
 #else
-
     { // QK^TV
         MatrixA qk_m;
         nvcuda::wmma::load_matrix_sync(qk_m, squery, 16);
@@ -351,7 +354,7 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_
             for(int kv = 1; kv < num_kv_blocks; kv++) {
                 hdim = hdim*__half2float(sscale[kv*2]) + __half2float(red_buf[head_offset + (hi + hdi) * reduce_block + kv]) * __half2float(sscale[kv*2 + 1]);
             }
-            qkv[blockIdx.x * head_dim + hi + lane_index] = hdim / sf_lse[0];
+            qkv[blockIdx.x * head_dim + hi + hdi] = hdim / sf_lse[0];
         }
     }
 
