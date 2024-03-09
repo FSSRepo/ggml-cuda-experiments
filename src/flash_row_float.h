@@ -5,7 +5,7 @@
 
 template<int head_dim, int num_warps, int kv_tensor, int kv_block>
 __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer for partials result */,
-    const half* value, const half* mask, int kv_size, float scale, int reduce_block, int head_stride) {
+    const half* value, const half* mask, half* tmp, int kv_size, float scale, int head_stride, int r_kv_heads) {
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
 
@@ -20,6 +20,7 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
     half*  warp_buffer_half = (half*)warp_buffer;
 #endif
     const int HD2 = head_dim / 2;
+    const int kv_head_offset = (blockIdx.y / r_kv_heads) * head_stride;
 
     // load query with 128x2 shape (repeat row twice)
     const float2* query_ = (const float2*)(query + head_dim*blockIdx.y); // shift as head
@@ -56,7 +57,7 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
 
 #pragma unroll
         for (int kv = 0; kv < kv_per_warp; kv += kv_tensor) {
-            nvcuda::wmma::load_matrix_sync(key_m, key + head_stride*blockIdx.y + (blockIdx.x*kv_block + kvi + kv)*head_dim, 16);
+            nvcuda::wmma::load_matrix_sync(key_m, key + (blockIdx.x*kv_block + kvi + kv)*head_dim + kv_head_offset, 16);
             nvcuda::wmma::fill_fragment(kq_m, 0.0f);
             nvcuda::wmma::mma_sync(kq_m, query_m, key_m, kq_m);
             nvcuda::wmma::store_matrix_sync(warp_buffer, kq_m, 16, nvcuda::wmma::mem_row_major);
@@ -92,7 +93,7 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
 
         float S = 0.0f;
 
-        if(M > -INFINITY) {
+        if(M != -INFINITY) {
             for (int kv = lane_index*kv_tensor; kv < kv_per_warp; kv += WARP_SIZE*kv_tensor) {
                 S += expf(sscores[kvi + kv] - M);
                 S += expf(sscores[kvi + kv + 1] - M);
@@ -129,8 +130,6 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
                 S0 = S0*ms0 + S1*ms1;
                 M0 = M;
             }
-
-            // printf("M = %.4f, S= %.4f\n", M0, S0);
 
             // real softmax M and S for this block
             sscores[kv_block] = M0;
@@ -178,7 +177,12 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
         MatrixBT value_m;
         Accum qkv_m;
 
-        const int reduce_exccedent = reduce_block - gridDim.x;
+        // const int qkv_block_size = gridDim.x * head_dim + gridDim.x * 2;
+        // const int qkv_head_offset = kv_head_offset + (blockIdx.y % r_kv_heads) * qkv_block_size;
+
+        const int qkv_block_size = gridDim.x * head_dim + gridDim.x * 2;
+        const int qkv_head_offset = blockIdx.y * qkv_block_size;
+
 #pragma unroll
         for(int h0 = 0; h0 < head_dim; h0 += num_warps) {
             const int hi = h0 + warp_index;
@@ -186,10 +190,10 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
                 break;
             }
 
-            const int output_offset = blockIdx.y * head_stride + hi * reduce_block;
+            const int output_offset = qkv_head_offset + hi * gridDim.x;
 
             // `value` need to be transposed
-            nvcuda::wmma::load_matrix_sync(value_m, value + hi * kv_size + blockIdx.x*kv_block + blockIdx.y * head_stride, 16);
+            nvcuda::wmma::load_matrix_sync(value_m, value + hi * kv_size + blockIdx.x*kv_block + kv_head_offset, 16);
             nvcuda::wmma::fill_fragment(qkv_m, 0.0f);
             nvcuda::wmma::mma_sync(qkv_m, qk_m, value_m, qkv_m);
             nvcuda::wmma::store_matrix_sync(warp_buffer, qkv_m, 16, nvcuda::wmma::mem_row_major);
@@ -216,18 +220,13 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
                 // printf("real dim %d = %.4f, S=%.4f\n", hi, real_dim, sscores[kv_block + 1]);
 
                 // assume the key has been processed by blocks launched per head
-
-                key[output_offset + blockIdx.x] = __float2half(hdim);
-                key[blockIdx.y * head_stride + head_dim * reduce_block + blockIdx.x*2] = __float2half(sscores[kv_block]); // max of this kv block
-                key[blockIdx.y * head_stride + head_dim * reduce_block + blockIdx.x*2 + 1] = __float2half(sscores[kv_block + 1]); // sum of this kv block
-
-                if(blockIdx.x == 0) { // just the first block will do this
-                    for(int i = 0; i < reduce_exccedent; i ++) {
-                        // this is a padding to perform a matrix multiplication without incorrect values
-                        key[output_offset + gridDim.x + i] = __float2half(0.0f);
-                    }
-                }
+                tmp[output_offset + blockIdx.x] = __float2half(hdim);
             }
+        }
+
+        if(warp_index == 0 && lane_index == 0) {
+            tmp[qkv_head_offset + gridDim.x * head_dim + blockIdx.x*2] = __float2half(sscores[kv_block]); // max of this kv block
+            tmp[qkv_head_offset + gridDim.x * head_dim + blockIdx.x*2 + 1] = __float2half(sscores[kv_block + 1]); // sum of this kv block
         }
     }
 #else
@@ -302,28 +301,27 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
 }
 
 template<int head_dim, int num_warps>
-__global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_kv_blocks, int reduce_block) {
+__global__ void fa_reduce(const half* partial_qkv, float* qkv, int kv_size, int num_kv_blocks, int r_kv_heads) {
     const int lane_index = threadIdx.x;
     const int warp_index = threadIdx.y;
 
-    const int tensor_elements = WMMA_M*WMMA_N;
-    //const int hi_per_tensor = tensor_elements / reduce_block;
-    const int head_offset = head_dim * kv_size * blockIdx.x;
+    // const int qkv_partial_offset =
+    //     (blockIdx.x / r_kv_heads) * kv_size * head_dim /* key tensor data */ +
+    //     (blockIdx.x % r_kv_heads) * (num_kv_blocks * head_dim + num_kv_blocks*2);
+
+    const int qkv_partial_offset = blockIdx.x * (num_kv_blocks * head_dim + num_kv_blocks*2);
 
     extern __shared__ char shmem[];
-    half * sscale = (half *)shmem;
-    float* sf_lse = (float*)(shmem + tensor_elements*sizeof(half));
-    // float* warp_buffer = (float*)(shmem + tensor_elements*sizeof(half) + (kv_size/reduce_block + 2) * sizeof(float) + warp_index*(tensor_elements + 2)*sizeof(float));
+    float* softmax_lse = (float *)shmem;
 
-    // make scale 1.0 diagonal
     if(warp_index == 0 && lane_index == 0) {
-        const int softmax_lse_offset = head_offset + head_dim*reduce_block;
-        float M0 = __half2float(red_buf[softmax_lse_offset]);
-        float S0 = __half2float(red_buf[softmax_lse_offset + 1]);
+        const int softmax_lse_offset = qkv_partial_offset + num_kv_blocks * head_dim;
+        float M0 = __half2float(partial_qkv[softmax_lse_offset]);
+        float S0 = __half2float(partial_qkv[softmax_lse_offset + 1]);
 
         for(int i = 1; i < num_kv_blocks; i++) {
-            float M1 = __half2float(red_buf[softmax_lse_offset + i*2]);
-            float S1 = __half2float(red_buf[softmax_lse_offset + i*2 + 1]);
+            float M1 = __half2float(partial_qkv[softmax_lse_offset + i*2]);
+            float S1 = __half2float(partial_qkv[softmax_lse_offset + i*2 + 1]);
 
             float M = fmaxf(M0, M1);
 
@@ -333,14 +331,14 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_
             S0 = S0*ms0 + S1*ms1;
             M0 = M;
 
-            sscale[i*2    ] = __float2half(ms0);
-            sscale[i*2 + 1] = __float2half(ms1);
+            softmax_lse[i*2    ] = ms0;
+            softmax_lse[i*2 + 1] = ms1;
         }
 
-        sf_lse[0] = S0;
+        softmax_lse[0] = S0;
 
         // S0 is all sequence softmax denominator
-        // printf("CUDA S: %.4f M: %.4f\n", S0, M0);
+        // printf("%d CUDA =  M: %.4f S: %.4f\n", blockIdx.x, M0, S0);
     }
 
     __syncthreads();
@@ -350,46 +348,14 @@ __global__ void fa_reduce(const half* red_buf, float* qkv, int kv_size, int num_
     // reduce kv blocks (very slow!!)
     for(int hi = warp_index*hd_per_warp; hi < head_dim; hi += num_warps*hd_per_warp) {
         for(int hdi = lane_index; hdi < hd_per_warp; hdi += WARP_SIZE) {
-            float hdim = __half2float(red_buf[head_offset + (hi + hdi) * reduce_block]);
+            const int hdim_index = hi + hdi;
+            const int qkv_index = qkv_partial_offset + hdim_index * num_kv_blocks;
+            float hdim = __half2float(partial_qkv[qkv_index]);
             for(int kv = 1; kv < num_kv_blocks; kv++) {
-                hdim = hdim*__half2float(sscale[kv*2]) + __half2float(red_buf[head_offset + (hi + hdi) * reduce_block + kv]) * __half2float(sscale[kv*2 + 1]);
+                hdim = hdim * softmax_lse[kv*2] + __half2float(partial_qkv[qkv_index + kv]) * softmax_lse[kv * 2 + 1];
             }
-            qkv[blockIdx.x * head_dim + hi + hdi] = hdim / sf_lse[0];
+            qkv[blockIdx.x * head_dim + hdim_index] = hdim / softmax_lse[0];
         }
     }
-
-    // for(int j = 1 + warp_index; j < hi_per_tensor; j += num_warps) {
-    //     for(int i = lane_index; i < reduce_block; i += WARP_SIZE) {
-    //         sscale[j * reduce_block + i] = sscale[i];
-    //     }
-    // }
-
-//     MatrixA scale;
-//     MatrixBT partials;
-//     nvcuda::wmma::load_matrix_sync(scale, sscale, 16);
-//     Accum qkv_m;
-
-//     const int sum_diag = WMMA_K / hi_per_tensor;
-
-// #pragma unroll
-//     for (int h0 = 0; h0 < head_dim; h0 += num_warps*hi_per_tensor) {
-//         const int hi = h0 + warp_index*hi_per_tensor;
-//         nvcuda::wmma::load_matrix_sync(partials, red_buf + (head_offset + hi * reduce_block), 16);
-//         nvcuda::wmma::fill_fragment(qkv_m, 0.0f);
-//         nvcuda::wmma::mma_sync(qkv_m, scale, partials, qkv_m);
-//         nvcuda::wmma::store_matrix_sync(warp_buffer, qkv_m, 16, nvcuda::wmma::mem_row_major);
-
-//         // sum diagonal
-//         if (lane_index < hi_per_tensor) {
-//             float hdim = 0.0f;
-
-//             for (int d = 0; d < sum_diag; d++) {
-//                 const int diag_idx = lane_index * sum_diag + d;
-//                 hdim += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
-//             }
-
-//             qkv[blockIdx.x * head_dim + hi + lane_index] = hdim / sf_lse[0];
-//         }
-//     }
 }
 #endif

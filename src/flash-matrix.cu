@@ -35,17 +35,17 @@ void test_llama() {
         for(int h = 0; h < num_heads; h++) {
             mulmat_cpu(
                 ((float*)tensor_q->data) + (h * head_dim * batch_size),
-                ((half*)tensor_k->data)  + (h * head_dim * kv_size),
+                ((half*)tensor_k->data)  + ((h % num_heads) * head_dim * kv_size),
                 ((half*)tensor_mask->data),
                 scores + (h * kv_size * batch_size),
                 batch_size, kv_size, head_dim, scale, true);
-            softmax(scores + h * kv_size * batch_size, kv_size, batch_size);
+            softmax(scores + h * kv_size * batch_size, kv_size, batch_size, h);
         }
 
         for(int h = 0; h < num_heads; h++) {
             mulmat_cpu(scores + (h * kv_size * batch_size),
                 ((half*)tensor_v->data) + (h * head_dim*kv_size), nullptr,
-                qkv_cuda + h * head_dim * batch_size, batch_size, head_dim, kv_size, 1.0f, false);
+                qkv_cuda + h * head_dim * batch_size, batch_size, head_dim, kv_size, 1.0f, true);
         }
 
         // permute
@@ -76,15 +76,15 @@ void test_llama() {
         for(int h = 0; h < num_heads; h++) {
             for(int c = 0; c < head_dim; c++) {
                 for(int r = 0; r < kv_size; r++) {
-                    value_T[h * kv_size * head_dim + c * kv_size + r] = ((half*)tensor_v->data)[h * kv_size * head_dim + r*head_dim + c];
+                    value_T[h * kv_size * head_dim + r * head_dim + c] = ((half*)tensor_v->data)[h * kv_size * head_dim + c*kv_size + r];
                 }
             }
         }
 
         cudaMemcpyAsync(d_query, tensor_q->data,   head_dim * batch_size * num_heads * sizeof(float), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_key,   tensor_k->data,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
-        // cudaMemcpyAsync(d_value, tensor_v->data,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_value, value_T,          head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_value, tensor_v->data,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        // cudaMemcpyAsync(d_value, value_T,          head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_padded_mask,  tensor_mask->data,  PADD(batch_size, 32) * kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
 
         fill_buffer(qkv_cuda, 0.0f, head_dim * batch_size * num_heads);
@@ -118,7 +118,7 @@ void test_llama() {
                 head_dim * 2, head_dim * kv_size * 2, head_dim * kv_size * num_heads * 2, // nb key value
                 head_dim, num_heads, batch_size, 1);
         } else if(batch_size == 1) {
-            const int num_warps = 8;
+            const int num_warps = 2;
             constexpr int kv_per_block = 256;
 
             // assert(kv_size % kv_per_block == 0);
@@ -131,7 +131,7 @@ void test_llama() {
                 num_warps * (256 + 2) * sizeof(float) /* tensor core result buffer per warp */;
 
             int reduce_block = ((grid_dim.x + WMMA_M - 1) / WMMA_M) * WMMA_N;
-            flash_attn_row<128, num_warps, 2, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>(d_query, d_key, d_value, d_padded_mask, kv_size, scale, reduce_block, head_dim*kv_size);
+            flash_attn_row<128, num_warps, 2, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>(d_query, d_key, d_value, d_padded_mask, nullptr, kv_size, scale, reduce_block, head_dim*kv_size);
             fa_reduce<128, num_warps><<<num_heads, block_dim, shmem, stream>>>(d_key, d_qkv, kv_size, kv_size / kv_per_block, reduce_block);
         }
 

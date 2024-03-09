@@ -27,7 +27,7 @@ void mulmat_cpu(const float* A, const half* B, const half* mask, float* C, uint3
     }
 }
 
-void softmax(float* scores, int kv_size, int batch_size) {
+void softmax(float* scores, int kv_size, int batch_size, int head) {
     for(int b = 0; b < batch_size; b++) {
         float M = -INFINITY;
         float S = 0.0f;
@@ -42,7 +42,7 @@ void softmax(float* scores, int kv_size, int batch_size) {
             }
         }
 
-        // printf("softmax M = %.4f, S= %.4f\n", M, S);
+        printf("%d = softmax M = %.4f, S= %.4f\n", head, M, S);
 
         for(int i = 0; i < kv_size;i++) {
             scores[b*kv_size + i] = expf(scores[b*kv_size + i] - M) / S;

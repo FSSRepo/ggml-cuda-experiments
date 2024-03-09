@@ -18,6 +18,11 @@
         "cmath": "cpp",
         "cstring": "cpp",
         "xlocale": "cpp",
-        "ratio": "cpp"
+        "ratio": "cpp",
+        "format": "cpp",
+        "initializer_list": "cpp",
+        "list": "cpp",
+        "vector": "cpp",
+        "xstring": "cpp"
     }
 }
