@@ -42,8 +42,6 @@ void softmax(float* scores, int kv_size, int batch_size, int head) {
             }
         }
 
-        printf("%d = softmax M = %.4f, S= %.4f\n", head, M, S);
-
         for(int i = 0; i < kv_size;i++) {
             scores[b*kv_size + i] = expf(scores[b*kv_size + i] - M) / S;
         }

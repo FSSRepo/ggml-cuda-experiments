@@ -14,6 +14,7 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
     extern __shared__ char shmem[];
     half2* squery2      = (half2*)shmem; // load query buffer
     half * squery       = (half *)shmem; // probabilities buffer after online softmax
+    // half * kv_cache_buffer = (half*)(shmem + head_dim*kv_tensor*sizeof(half));
     float* sscores      = (float*)(shmem + head_dim*kv_tensor*sizeof(half)); // scores buffer after QK^T
     float* warp_buffer  = (float*)(shmem + head_dim*kv_tensor*sizeof(half) + (kv_block + 2)*sizeof(float) + (warp_index*warp_data_size*sizeof(float)));
 #ifndef FA_KV_BLOCK_256
@@ -298,6 +299,205 @@ __global__ void flash_attn_row(const float* query, half* key /* reuse key buffer
         }
     }
 #endif
+}
+
+template<int head_dim, int num_warps, int kv_block> // kv_block should be tensor elements
+__global__ void flash_attn_row_fast(
+    const half* __restrict__ query,
+    const half* __restrict__ key,
+    const half* __restrict__ value,
+    const half* __restrict__ mask,
+    half* __restrict__ qkv_tmp,
+    const float scale, const int kv_size, const int qkv_partial_size, int r_kv_heads, int kv_stride, int head_stride) {
+    const int lane_index = threadIdx.x;
+    const int warp_index = threadIdx.y;
+
+    cooperative_groups::thread_block blk = cooperative_groups::this_thread_block();
+
+    // Query half[kv_block]
+    // Key half[kv_block][head_dim] | Value half[head_dim][kv_block]
+    // softmax
+    extern __shared__ char shmem[];
+    half * sh_query =       (half *)shmem;
+    half2* sh_query2 =      (half2*)shmem;
+    half * sh_kv_buffer =   (half *)(shmem + kv_block*sizeof(half));
+    half * sh_softmax =     (half *)(sh_kv_buffer + kv_block*head_dim);
+    float* warp_buffer =    (float*)(sh_softmax + num_warps*2 + warp_index*kv_block*2);
+
+    // load query in shared memory
+    const int query_per_tensor = kv_block / head_dim;
+    const int kv_head_index = blockIdx.y / r_kv_heads;
+    const int HD2 = head_dim / 2;
+
+#pragma unroll
+    for (int qo = 0; qo < query_per_tensor; qo++) {
+        if(qo == 0) { // first read from global memory
+            cooperative_groups::memcpy_async(blk, sh_query, query + blockIdx.y*head_dim, sizeof(half) * head_dim);
+            cooperative_groups::wait(blk);
+        } else { // copy from shared memory
+            int h_idx = threadIdx.y*WARP_SIZE + threadIdx.x;
+            if(h_idx < HD2) {
+                sh_query2[qo*HD2 + h_idx] = sh_query2[h_idx];
+            }
+        }
+    }
+    __syncthreads();
+
+    // load key in shared memory
+    {
+        for (int kv = 0; kv < kv_block; kv += query_per_tensor) {
+            for (int qo = 0; qo < query_per_tensor; qo++) {
+                const int key_index = kv + qo;
+                cooperative_groups::memcpy_async(blk,
+                    sh_kv_buffer + key_index*head_dim,
+                    key + key_index*kv_stride + kv_head_index*head_stride, sizeof(half) * head_dim);
+            }
+        }
+        cooperative_groups::wait(blk);
+    }
+
+    const int kv_per_warp = kv_block / num_warps;
+    const int kvi = warp_index*kv_per_warp;
+
+    // perform QK^T*scale + mask and get max for softmax
+    {   // QK^T
+        MatrixA  qm;
+        nvcuda::wmma::load_matrix_sync(qm, sh_query, 16);
+        MatrixBT km;
+        Accum    kqm;
+
+        const int num_diag = WMMA_K / query_per_tensor;
+        float M = -INFINITE;
+        // half* warp_tmp_buffer = sh_kv_buffer + kvi*head_dim; // save results from tensor cores
+
+#pragma unroll
+        for (int kv = 0; kv < kv_per_warp; kv += query_per_tensor) {
+            nvcuda::wmma::load_matrix_sync(km, sh_kv_buffer + (kvi + kv)*head_dim, 16);
+            nvcuda::wmma::fill_fragment(kqm, 0.0f);
+            nvcuda::wmma::mma_sync(kqm, qm, km, kqm);
+            nvcuda::wmma::store_matrix_sync(warp_buffer, kqm, 16, nvcuda::wmma::mem_row_major);
+
+            // sum diagonal
+            if (lane_index < query_per_tensor) {
+                // TODO: make this half type
+                float seq = 0.0f;
+                const int seq_idx = kvi + kv + lane_index;
+#pragma unroll
+                for (int d0 = 0; d0 < num_diag; d0++) {
+                    const int diag_idx = d0 + lane_index * num_diag;
+                    seq += warp_buffer[diag_idx*WMMA_M + diag_idx]; // sum diagonal
+                }
+                seq = seq*scale + __half2float(mask[blockIdx.x*kv_block + seq_idx]);
+                // store sequence result
+                sh_query[seq_idx] = __float2half(seq); // save as float for softmax
+                M = fmaxf(M, seq);
+            }
+        }
+        __syncthreads();
+
+        // online softmax
+        M = warp_reduce_max(M);
+
+        float S = 0.0f;
+
+        if(M != -INFINITY) {
+            for (int kv = lane_index; kv < kv_per_warp; kv += WARP_SIZE) {
+                S += expf(__half2float(sh_query[kvi + kv]) - M);
+            }
+        }
+
+        S = warp_reduce_sum(S);
+
+        if(lane_index == 0) { // first head
+            sh_softmax[warp_index*2] = __float2half(M);
+            sh_softmax[warp_index*2 + 1] = __float2half(S);
+            // printf("warp index: %d, M= %.4f, S= %.4f\n", warp_index, M, S);
+        }
+
+        __syncthreads();
+
+        if(warp_index == 0 && lane_index == 0) {
+            half M0 = sh_softmax[0];
+            half S0 = sh_softmax[1];
+            for(int w = 1; w < num_warps; w++) {
+                half M1 = sh_softmax[w*2];
+                half S1 = sh_softmax[w*2 + 1];
+
+                half M = __hmax(M0, M1);
+
+                half ms0 = hexp(M0 - M);
+                half ms1 = hexp(M1 - M);
+
+                S0 = S0*ms0 + S1*ms1;
+                M0 = M;
+            }
+            // real softmax M and S for this block
+            sh_softmax[0] = M0;
+            sh_softmax[1] = S0;
+        }
+        __syncthreads();
+    }
+
+    {
+        float M = __half2float(sh_softmax[0]);
+        #pragma unroll
+        for (int k0 = lane_index; k0 < kv_per_warp; k0 += WARP_SIZE) {
+            const int kv = k0 + lane_index;
+            if(kv >= kv_per_warp) {
+                break;
+            }
+            const int kv_offset = kvi + kv;
+            sh_query[kv_offset] = __float2half(expf(__half2float(sh_query[kv_offset]) - M));
+        }
+        __syncthreads();
+    }
+
+    // load values in shared memory (no contiguous) (no coalesing acceses!!)
+    for (int kv = warp_index; kv < kv_block; kv += num_warps) {
+        const int kv_offset = kv*kv_stride + kv_head_index*head_stride;
+        for (int hdim = lane_index; hdim < head_dim; hdim += WARP_SIZE) {
+            sh_kv_buffer[hdim*kv_block + kv] = value[kv_offset + hdim];
+        }
+    }
+    __syncthreads();
+
+    // perform softmax(QK^T)V
+    {
+        MatrixA  kqm;
+        nvcuda::wmma::load_matrix_sync(kqm, sh_query, 16);
+        MatrixBT vm;
+        Accum    qkvm;
+
+        const int qkv_head_offset = blockIdx.y * qkv_partial_size;
+
+#pragma unroll
+        for(int h0 = 0; h0 < head_dim; h0 += num_warps) {
+            const int hi = h0 + warp_index;
+            if(hi >= head_dim) {
+                break;
+            }
+
+            const int output_offset = qkv_head_offset + hi * gridDim.x;
+
+            nvcuda::wmma::load_matrix_sync(vm, sh_kv_buffer + hi * kv_block, 16);
+            nvcuda::wmma::fill_fragment(qkvm, 0.0f);
+            nvcuda::wmma::mma_sync(qkvm, kqm, vm, qkvm);
+            nvcuda::wmma::store_matrix_sync(warp_buffer, qkvm, 16, nvcuda::wmma::mem_row_major);
+
+            if (lane_index == 0) {
+                float hdim = 0.0f;
+                for (int d = 0; d < WMMA_K; d++) {
+                    hdim += warp_buffer[d*WMMA_M + d]; // sum diagonal
+                }
+                qkv_tmp[output_offset + blockIdx.x] = __float2half(hdim);
+            }
+        }
+
+        if(warp_index == 0 && lane_index == 0) {
+            qkv_tmp[qkv_head_offset + gridDim.x * head_dim + blockIdx.x*2] = sh_softmax[0]; // max of this kv block
+            qkv_tmp[qkv_head_offset + gridDim.x * head_dim + blockIdx.x*2 + 1] = sh_softmax[1]; // sum of this kv block
+        }
+    }
 }
 
 template<int head_dim, int num_warps>
