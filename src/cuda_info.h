@@ -68,7 +68,6 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
     return x;
 }
 
-
 static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {

@@ -216,11 +216,7 @@ static __global__ void flash_attn_ext_f16(
 
                     const half2 s = ss2[j*T2 + p];
 
-                    // int seq_idx = p*2 + ic;
-
-                    // if(seq_idx >= 124 && seq_idx < 132 && j == 1) {
-                    //     printf("QK seq %d = %.4f | warp= %d\nQK seq %d = %.4f | warp= %d\n", p*2 + ic, __half2float(s.x), warp_id, p*2 + ic + 1, __half2float(s.y), warp_id);
-                    // }
+                    int seq_idx = p*2 + ic;
 
                     smax = __hmax2(smax, s);
                     M[j] = __hmax(M[j], __hmax(s.x, s.y));
@@ -228,7 +224,7 @@ static __global__ void flash_attn_ext_f16(
 
                 M[j] = warp_reduce_max(M[j]);
 
-                // if(j == 0 && lane_id == 0) {
+                // if(j == 0 && lane_id == 0 && blockIdx.y == 0) {
                 //     printf("max: %.4f, warp= %d\n", __half2float(M[0]), warp_id);
                 // }
 
@@ -272,7 +268,7 @@ static __global__ void flash_attn_ext_f16(
 
             smax = warp_reduce_max(smax);
 
-            // if(lane_id == 0) {
+            // if(lane_id == 0 && blockIdx.x) {
             //     printf("max 0: %.4f, max 1: %.4f, warp= %d\n", __half2float(smax.x), __half2float(smax.y), warp_id);
             // }
 
@@ -424,6 +420,9 @@ static __global__ void flash_attn_ext_f16(
         // final rescale with 1/S and store to global memory
         for (int j = 0; j < Q && iq1 + j < ne01; ++j) {
             const half S = ss[j*T + 0];
+            // if(blockIdx.y == 0 && lane_id == 0) {
+            //     printf("Suma: %.4f\n", __half2float(S));
+            // }
 
             for (int i0 = 0; i0 < D; i0 += NW) {
                 const int i = i0 + lane_id;

@@ -78,6 +78,8 @@ void test_llama() {
     float* qkv_cuda =   (float*)malloc(head_dim * batch_size * num_heads * sizeof(float));
     float* scores =     (float*)malloc(batch_size * kv_size  * num_heads * sizeof(float));
     half* value_T =     (half*)malloc(head_dim * kv_size  * num_heads * sizeof(half));
+    half* key_cont =  (half*)malloc(head_dim * kv_size  * num_heads * sizeof(half));
+    half* value_cont =  (half*)malloc(head_dim * kv_size  * num_heads * sizeof(half));
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
@@ -118,7 +120,7 @@ void test_llama() {
         float *d_qkv, *d_query;
 
         cudaMalloc((void **)&d_query,   head_dim * batch_size * num_heads * sizeof(float));
-        cudaMalloc((void **)&d_query_fp16,   head_dim * batch_size * num_heads * sizeof(half));
+        cudaMalloc((void **)&d_query_fp16,   (head_dim * batch_size * num_heads) * sizeof(half));
         cudaMalloc((void **)&d_key,     head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_value,   head_dim * kv_size * num_heads * sizeof(half));
         cudaMalloc((void **)&d_padded_mask, PADD(batch_size, 32) * kv_size * sizeof(half));
@@ -129,6 +131,22 @@ void test_llama() {
             for(int c = 0; c < head_dim; c++) {
                 for(int r = 0; r < kv_size; r++) {
                     value_T[h * kv_size * head_dim + r * head_dim + c] = ((half*)tensor_v->data)[h * kv_size * head_dim + c*kv_size + r];
+                }
+            }
+        }
+
+        for(int h = 0; h < num_heads; h++) {
+            for(int c = 0; c < head_dim; c++) {
+                for(int r = 0; r < kv_size; r++) {
+                    value_cont[h * kv_size * head_dim + c * kv_size + r] = ((half*)tensor_v->data)[h * head_dim + c + r*head_dim*num_heads];
+                }
+            }
+        }
+
+        for(int h = 0; h < num_heads; h++) {
+            for(int c = 0; c < head_dim; c++) {
+                for(int r = 0; r < kv_size; r++) {
+                    key_cont[h * kv_size * head_dim + r * head_dim + c] = ((half*)tensor_k->data)[h * head_dim + c + r*head_dim*num_heads];
                 }
             }
         }
@@ -149,7 +167,9 @@ void test_llama() {
         cudaMemcpyAsync(d_query, tensor_q->data,   head_dim * batch_size * num_heads * sizeof(float), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_query_fp16, q_f16,   head_dim * batch_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_key,   tensor_k->data,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_value, tensor_v->data,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_key,   key_cont,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(d_value, value_cont,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
+        // cudaMemcpyAsync(d_value, tensor_v->data,   head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         // cudaMemcpyAsync(d_value, value_T,          head_dim * kv_size * num_heads * sizeof(half), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_padded_mask,  tensor_mask->data,  PADD(batch_size, 32) * kv_size * sizeof(half), cudaMemcpyHostToDevice, stream);
 
@@ -185,8 +205,9 @@ void test_llama() {
                 // head_dim * 2, head_dim * kv_size * 2, head_dim * kv_size * num_heads * 2, // nb key value
                 head_dim, num_heads, batch_size, 1);
         } else if(batch_size == 1) {
-            if(false) {
-                const int num_warps = 2;
+            if(true) {
+                printf("FLASH DECODING NO SRAM\n");
+                const int num_warps = 8;
                 constexpr int kv_per_block = 256;
 
                 // assert(kv_size % kv_per_block == 0);
@@ -195,9 +216,10 @@ void test_llama() {
 
                 int shmem =
                     head_dim*2*sizeof(half) /* query buffer */ +
-                    (kv_per_block + 2)*sizeof(float) /* scores buffer */ +
-                    num_warps * (256 + 2) * sizeof(float) /* tensor core result buffer per warp */;
+                    2*sizeof(half) /* scores buffer */ +
+                    num_warps * (256 + 2) * sizeof(half) /* tensor core result buffer per warp */;
                 int num_kv_blocks = kv_size / kv_per_block;
+
                 half* d_temporal;
                 cudaMalloc((void **)&d_temporal,  ((num_kv_blocks * head_dim) + num_kv_blocks*2) * num_heads * sizeof(half));
 
@@ -205,7 +227,7 @@ void test_llama() {
                 fa_reduce<128, num_warps><<<num_heads, block_dim, shmem, stream>>>(d_temporal, d_qkv, kv_size, kv_size / kv_per_block, 1);
             } else {
                 printf("FLASH DECODING\n");
-                const int num_warps = 1;
+                const int num_warps = 4;
                 constexpr int kv_per_block = 256;
                 const int num_kv_blocks = kv_size / kv_per_block;
 
@@ -214,9 +236,10 @@ void test_llama() {
                 const int tensor_elements = 256;
 
                 int shmem = tensor_elements*sizeof(half) + // query
-                    kv_per_block*head_dim*sizeof(half) + // kv size
-                    num_warps*2*sizeof(half) + // softmax
-                    num_warps*tensor_elements*sizeof(float); // query
+                            kv_per_block*head_dim*sizeof(half) + // kv size
+                            num_warps*2*sizeof(half) + // softmax
+                            num_warps*tensor_elements*sizeof(half); // query
+                int shmem_red = num_kv_blocks*2*sizeof(float);
 
                 printf("Shared memory: %.2f KB\n", shmem / 1024.0f);
 
@@ -225,10 +248,10 @@ void test_llama() {
                 half* d_temporal;
                 cudaMalloc((void **)&d_temporal,  ((num_kv_blocks * head_dim) + num_kv_blocks*2) * num_heads * sizeof(half));
 
-                // flash_attn_row_fast<128, num_warps, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>(
-                //     d_query_fp16, d_key, d_value, d_padded_mask, d_temporal, scale, kv_size, ((num_kv_blocks * head_dim) + num_kv_blocks*2), 1, 
-                //     head_dim*num_heads, head_dim);
-                fa_reduce<128, num_warps><<<num_heads, block_dim, shmem, stream>>>(d_temporal, d_qkv, kv_size, kv_size / kv_per_block, 1);
+                flash_attn_row_fast<128, num_warps, kv_per_block><<<grid_dim, block_dim, shmem, stream>>>(
+                    d_query_fp16, d_key, d_value, d_padded_mask, d_temporal, scale, kv_size, ((num_kv_blocks * head_dim) + num_kv_blocks*2), 1, 
+                    head_dim*num_heads, head_dim);
+                fa_reduce<128, num_warps><<<num_heads, block_dim, shmem_red, stream>>>(d_temporal, d_qkv, kv_size, kv_size / kv_per_block, 1);
             }
         }
 
